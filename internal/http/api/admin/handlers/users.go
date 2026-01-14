@@ -122,16 +122,17 @@ func (h *UserHandler) List(c *gin.Context) {
 	out := make([]gin.H, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, gin.H{
-			"id":              row.ID,
-			"username":        row.Username,
-			"email":           row.Email,
-			"user_group_id":   row.UserGroupID,
-			"daily_max_usage": row.DailyMaxUsage,
-			"rate_limit":      row.RateLimit,
-			"active":          row.Active,
-			"disabled":        row.Disabled,
-			"created_at":      row.CreatedAt,
-			"updated_at":      row.UpdatedAt,
+			"id":                 row.ID,
+			"username":           row.Username,
+			"email":              row.Email,
+			"user_group_id":      row.UserGroupID.Clean(),
+			"bill_user_group_id": row.BillUserGroupID.Clean(),
+			"daily_max_usage":    row.DailyMaxUsage,
+			"rate_limit":         row.RateLimit,
+			"active":             row.Active,
+			"disabled":           row.Disabled,
+			"created_at":         row.CreatedAt,
+			"updated_at":         row.UpdatedAt,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"users": out})
@@ -154,27 +155,28 @@ func (h *UserHandler) Get(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"id":              user.ID,
-		"username":        user.Username,
-		"email":           user.Email,
-		"user_group_id":   user.UserGroupID,
-		"daily_max_usage": user.DailyMaxUsage,
-		"rate_limit":      user.RateLimit,
-		"active":          user.Active,
-		"disabled":        user.Disabled,
-		"created_at":      user.CreatedAt,
-		"updated_at":      user.UpdatedAt,
+		"id":                 user.ID,
+		"username":           user.Username,
+		"email":              user.Email,
+		"user_group_id":      user.UserGroupID.Clean(),
+		"bill_user_group_id": user.BillUserGroupID.Clean(),
+		"daily_max_usage":    user.DailyMaxUsage,
+		"rate_limit":         user.RateLimit,
+		"active":             user.Active,
+		"disabled":           user.Disabled,
+		"created_at":         user.CreatedAt,
+		"updated_at":         user.UpdatedAt,
 	})
 }
 
 // updateUserRequest defines the request body for user updates.
 type updateUserRequest struct {
-	Username      *string  `json:"username"`
-	Email         *string  `json:"email"`
-	UserGroupID   *uint64  `json:"user_group_id"`
-	DailyMaxUsage *float64 `json:"daily_max_usage"`
-	RateLimit     *int     `json:"rate_limit"`
-	Disabled      *bool    `json:"disabled"`
+	Username      *string              `json:"username"`
+	Email         *string              `json:"email"`
+	UserGroupID   *models.UserGroupIDs `json:"user_group_id"`
+	DailyMaxUsage *float64             `json:"daily_max_usage"`
+	RateLimit     *int                 `json:"rate_limit"`
+	Disabled      *bool                `json:"disabled"`
 }
 
 // Update modifies a user account.
@@ -201,11 +203,7 @@ func (h *UserHandler) Update(c *gin.Context) {
 		updates["email"] = strings.TrimSpace(*body.Email)
 	}
 	if body.UserGroupID != nil {
-		if *body.UserGroupID == 0 {
-			updates["user_group_id"] = nil
-		} else {
-			updates["user_group_id"] = *body.UserGroupID
-		}
+		updates["user_group_id"] = body.UserGroupID.Clean()
 	}
 	if body.DailyMaxUsage != nil {
 		updates["daily_max_usage"] = *body.DailyMaxUsage

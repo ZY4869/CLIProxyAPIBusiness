@@ -19,6 +19,8 @@ type PrepaidCard struct {
 	RedeemedUserID *uint64 `gorm:"index"`                     // User who redeemed the card.
 	RedeemedUser   *User   `gorm:"foreignKey:RedeemedUserID"` // Redeeming user record.
 
+	UserGroupID *uint64 `gorm:"index"` // User group scope for deductions, if any.
+
 	CreatedAt  time.Time  `gorm:"not null;autoCreateTime"` // Creation timestamp.
 	RedeemedAt *time.Time // Redemption time, if redeemed.
 }

@@ -38,6 +38,8 @@ type Bill struct {
 	UserID uint64 `gorm:"not null;index"`    // Related user ID.
 	User   User   `gorm:"foreignKey:UserID"` // Related user record.
 
+	UserGroupID UserGroupIDs `gorm:"type:jsonb;not null;default:'[]'"` // User group IDs granted by this bill.
+
 	PeriodType BillPeriodType `gorm:"not null"` // Billing period type.
 
 	Amount float64 `gorm:"type:decimal(10,2);not null;default:0"` // Bill amount.

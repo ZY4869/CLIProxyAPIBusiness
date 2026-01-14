@@ -26,12 +26,13 @@ func NewPrepaidCardHandler(db *gorm.DB) *PrepaidCardHandler {
 
 // createPrepaidCardRequest captures the payload for creating a single card.
 type createPrepaidCardRequest struct {
-	Name      string  `json:"name"`       // Display name for the card.
-	CardSN    string  `json:"card_sn"`    // Card serial number.
-	Password  string  `json:"password"`   // Redemption password.
-	Amount    float64 `json:"amount"`     // Initial amount and balance.
-	ValidDays *int    `json:"valid_days"` // Optional validity period in days.
-	IsEnabled *bool   `json:"is_enabled"` // Optional active flag.
+	Name        string  `json:"name"`          // Display name for the card.
+	CardSN      string  `json:"card_sn"`       // Card serial number.
+	Password    string  `json:"password"`      // Redemption password.
+	Amount      float64 `json:"amount"`        // Initial amount and balance.
+	UserGroupID *uint64 `json:"user_group_id"` // Optional user group constraint.
+	ValidDays   *int    `json:"valid_days"`    // Optional validity period in days.
+	IsEnabled   *bool   `json:"is_enabled"`    // Optional active flag.
 }
 
 // Create validates input and persists a new prepaid card with initial balance.
@@ -74,15 +75,22 @@ func (h *PrepaidCardHandler) Create(c *gin.Context) {
 	if body.IsEnabled != nil {
 		isEnabled = *body.IsEnabled
 	}
+
+	var userGroupID *uint64
+	if body.UserGroupID != nil && *body.UserGroupID != 0 {
+		idCopy := *body.UserGroupID
+		userGroupID = &idCopy
+	}
 	card := models.PrepaidCard{
-		Name:      name,
-		CardSN:    cardSN,
-		Password:  password,
-		Amount:    body.Amount,
-		Balance:   body.Amount,
-		ValidDays: validDays,
-		IsEnabled: isEnabled,
-		CreatedAt: now,
+		Name:        name,
+		CardSN:      cardSN,
+		Password:    password,
+		Amount:      body.Amount,
+		Balance:     body.Amount,
+		UserGroupID: userGroupID,
+		ValidDays:   validDays,
+		IsEnabled:   isEnabled,
+		CreatedAt:   now,
 	}
 	if errCreate := h.db.WithContext(c.Request.Context()).Create(&card).Error; errCreate != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "create prepaid card failed"})
@@ -98,6 +106,7 @@ type batchCreatePrepaidCardRequest struct {
 	Count          int     `json:"count"`           // Number of cards to create.
 	CardSNPrefix   string  `json:"card_sn_prefix"`  // Optional card serial prefix.
 	PasswordLength int     `json:"password_length"` // Length of generated passwords.
+	UserGroupID    *uint64 `json:"user_group_id"`   // Optional user group constraint.
 	ValidDays      *int    `json:"valid_days"`      // Optional validity period in days.
 	IsEnabled      *bool   `json:"is_enabled"`      // Optional active flag.
 }
@@ -145,6 +154,11 @@ func (h *PrepaidCardHandler) BatchCreate(c *gin.Context) {
 	if body.IsEnabled != nil {
 		isEnabled = *body.IsEnabled
 	}
+	var userGroupID *uint64
+	if body.UserGroupID != nil && *body.UserGroupID != 0 {
+		idCopy := *body.UserGroupID
+		userGroupID = &idCopy
+	}
 	now := time.Now().UTC()
 	created := make([]gin.H, 0, body.Count)
 	errTx := h.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
@@ -158,14 +172,15 @@ func (h *PrepaidCardHandler) BatchCreate(c *gin.Context) {
 				return errPass
 			}
 			card := models.PrepaidCard{
-				Name:      name,
-				CardSN:    prefix + cardSN,
-				Password:  password,
-				Amount:    body.Amount,
-				Balance:   body.Amount,
-				ValidDays: validDays,
-				IsEnabled: isEnabled,
-				CreatedAt: now,
+				Name:        name,
+				CardSN:      prefix + cardSN,
+				Password:    password,
+				Amount:      body.Amount,
+				Balance:     body.Amount,
+				UserGroupID: userGroupID,
+				ValidDays:   validDays,
+				IsEnabled:   isEnabled,
+				CreatedAt:   now,
 			}
 			if errCreate := tx.Create(&card).Error; errCreate != nil {
 				return errCreate
@@ -247,12 +262,13 @@ func (h *PrepaidCardHandler) Get(c *gin.Context) {
 
 // updatePrepaidCardRequest captures optional fields for card updates.
 type updatePrepaidCardRequest struct {
-	Name      *string  `json:"name"`       // Optional updated name.
-	CardSN    *string  `json:"card_sn"`    // Optional updated serial.
-	Password  *string  `json:"password"`   // Optional updated password.
-	Amount    *float64 `json:"amount"`     // Optional updated amount.
-	ValidDays *int     `json:"valid_days"` // Optional updated validity in days.
-	IsEnabled *bool    `json:"is_enabled"` // Optional active flag.
+	Name        *string  `json:"name"`          // Optional updated name.
+	CardSN      *string  `json:"card_sn"`       // Optional updated serial.
+	Password    *string  `json:"password"`      // Optional updated password.
+	Amount      *float64 `json:"amount"`        // Optional updated amount.
+	UserGroupID *uint64  `json:"user_group_id"` // Optional user group constraint.
+	ValidDays   *int     `json:"valid_days"`    // Optional updated validity in days.
+	IsEnabled   *bool    `json:"is_enabled"`    // Optional active flag.
 }
 
 // Update applies validated field changes to a prepaid card.
@@ -308,6 +324,13 @@ func (h *PrepaidCardHandler) Update(c *gin.Context) {
 			return
 		}
 		updates["amount"] = *body.Amount
+	}
+	if body.UserGroupID != nil {
+		if *body.UserGroupID == 0 {
+			updates["user_group_id"] = nil
+		} else {
+			updates["user_group_id"] = *body.UserGroupID
+		}
 	}
 	if body.ValidDays != nil {
 		if *body.ValidDays < 0 {
@@ -368,6 +391,7 @@ func (h *PrepaidCardHandler) formatCard(card *models.PrepaidCard) gin.H {
 		"password":         card.Password,
 		"amount":           card.Amount,
 		"balance":          card.Balance,
+		"user_group_id":    card.UserGroupID,
 		"valid_days":       card.ValidDays,
 		"expires_at":       card.ExpiresAt,
 		"is_enabled":       card.IsEnabled,

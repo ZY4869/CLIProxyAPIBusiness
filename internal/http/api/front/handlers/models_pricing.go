@@ -11,6 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/billing"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelmapping"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelregistry"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	internalsettings "github.com/router-for-me/CLIProxyAPIBusiness/internal/settings"
@@ -66,7 +67,7 @@ func (h *ModelPricingHandler) List(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var user models.User
-	if errFind := h.db.WithContext(ctx).Select("id", "user_group_id").First(&user, userID).Error; errFind != nil {
+	if errFind := h.db.WithContext(ctx).Select("id", "user_group_id", "bill_user_group_id").First(&user, userID).Error; errFind != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query user failed"})
 		return
 	}
@@ -74,10 +75,6 @@ func (h *ModelPricingHandler) List(c *gin.Context) {
 	if errDefaultUserGroup != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query default user group failed"})
 		return
-	}
-	userGroupID := user.UserGroupID
-	if userGroupID == nil {
-		userGroupID = defaultUserGroupID
 	}
 
 	authGroupID, errAuthGroup := billing.ResolveDefaultAuthGroupID(ctx, h.db)
@@ -90,16 +87,56 @@ func (h *ModelPricingHandler) List(c *gin.Context) {
 	if authGroupID != nil {
 		authGroupIDValue = *authGroupID
 	}
-	var userGroupIDValue uint64
-	if userGroupID != nil {
-		userGroupIDValue = *userGroupID
-	}
+	defaultAuthGroupIDValue := authGroupIDValue
+
 	var defaultUserGroupIDValue uint64
 	if defaultUserGroupID != nil {
 		defaultUserGroupIDValue = *defaultUserGroupID
 	}
 
-	rules, errRules := h.loadBillingRules(ctx, authGroupIDValue, userGroupIDValue, authGroupIDValue, defaultUserGroupIDValue)
+	assignedUserGroupIDs := user.UserGroupID.Values()
+	billedUserGroupIDs := user.BillUserGroupID.Values()
+
+	userAccessGroups := make(map[uint64]struct{}, len(assignedUserGroupIDs)+len(billedUserGroupIDs)+1)
+	for _, id := range assignedUserGroupIDs {
+		if id == 0 {
+			continue
+		}
+		userAccessGroups[id] = struct{}{}
+	}
+	for _, id := range billedUserGroupIDs {
+		if id == 0 {
+			continue
+		}
+		userAccessGroups[id] = struct{}{}
+	}
+	if len(userAccessGroups) == 0 && defaultUserGroupID != nil && *defaultUserGroupID != 0 {
+		userAccessGroups[*defaultUserGroupID] = struct{}{}
+	}
+
+	billingUserGroupIDs := make([]uint64, 0, len(assignedUserGroupIDs)+len(billedUserGroupIDs)+1)
+	seenBilling := make(map[uint64]struct{}, cap(billingUserGroupIDs))
+	addBilling := func(id uint64) {
+		if id == 0 {
+			return
+		}
+		if _, ok := seenBilling[id]; ok {
+			return
+		}
+		seenBilling[id] = struct{}{}
+		billingUserGroupIDs = append(billingUserGroupIDs, id)
+	}
+	for _, id := range assignedUserGroupIDs {
+		addBilling(id)
+	}
+	for _, id := range billedUserGroupIDs {
+		addBilling(id)
+	}
+	if defaultUserGroupID != nil {
+		addBilling(*defaultUserGroupID)
+	}
+
+	rules, errRules := h.loadBillingRules(ctx, authGroupIDValue, billingUserGroupIDs, defaultAuthGroupIDValue, defaultUserGroupIDValue)
 	if errRules != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query billing rules failed"})
 		return
@@ -117,10 +154,71 @@ func (h *ModelPricingHandler) List(c *gin.Context) {
 	unpriced := make([]modelPricingItem, 0)
 
 	for _, item := range available {
-		rule := billing.SelectBillingRule(rules, authGroupIDValue, userGroupIDValue, authGroupIDValue, defaultUserGroupIDValue, item.Provider, item.ModelID)
+		provider := strings.TrimSpace(item.Provider)
+		modelID := strings.TrimSpace(item.ModelID)
+		if provider == "" || modelID == "" {
+			continue
+		}
+
+		var billingUserGroupID *uint64
+		if allowed, okAllowed := modelmapping.LookupUserGroupIDs(provider, modelID); okAllowed && len(allowed.Clean()) > 0 {
+			hasGroup := false
+			for _, allowedID := range allowed.Values() {
+				if _, ok := userAccessGroups[allowedID]; ok {
+					hasGroup = true
+					break
+				}
+			}
+			if !hasGroup {
+				continue
+			}
+
+			allowedSet := make(map[uint64]struct{}, len(allowed.Values()))
+			for _, allowedID := range allowed.Values() {
+				if allowedID == 0 {
+					continue
+				}
+				allowedSet[allowedID] = struct{}{}
+			}
+			for _, candidate := range assignedUserGroupIDs {
+				if _, ok := allowedSet[candidate]; ok {
+					idCopy := candidate
+					billingUserGroupID = &idCopy
+					break
+				}
+			}
+			if billingUserGroupID == nil {
+				for _, candidate := range billedUserGroupIDs {
+					if _, ok := allowedSet[candidate]; ok {
+						idCopy := candidate
+						billingUserGroupID = &idCopy
+						break
+					}
+				}
+			}
+			if billingUserGroupID == nil && defaultUserGroupID != nil {
+				if _, ok := allowedSet[*defaultUserGroupID]; ok {
+					billingUserGroupID = defaultUserGroupID
+				}
+			}
+		} else {
+			billingUserGroupID = user.UserGroupID.Primary()
+			if billingUserGroupID == nil {
+				billingUserGroupID = user.BillUserGroupID.Primary()
+			}
+			if billingUserGroupID == nil {
+				billingUserGroupID = defaultUserGroupID
+			}
+		}
+
+		if billingUserGroupID == nil || *billingUserGroupID == 0 {
+			continue
+		}
+
+		rule := billing.SelectBillingRule(rules, authGroupIDValue, *billingUserGroupID, defaultAuthGroupIDValue, defaultUserGroupIDValue, provider, modelID)
 		result := modelPricingItem{
-			Provider:      item.Provider,
-			Model:         item.ModelID,
+			Provider:      provider,
+			Model:         modelID,
 			DisplayName:   item.DisplayName,
 			OriginalModel: item.OriginalModel,
 		}
@@ -157,19 +255,29 @@ func (h *ModelPricingHandler) List(c *gin.Context) {
 }
 
 // loadBillingRules loads enabled billing rules for the given groups.
-func (h *ModelPricingHandler) loadBillingRules(ctx context.Context, authGroupID, userGroupID, defaultAuthGroupID, defaultUserGroupID uint64) ([]models.BillingRule, error) {
+func (h *ModelPricingHandler) loadBillingRules(ctx context.Context, authGroupID uint64, userGroupIDs []uint64, defaultAuthGroupID, defaultUserGroupID uint64) ([]models.BillingRule, error) {
 	if h.db == nil {
 		return nil, gorm.ErrInvalidDB
 	}
-	if authGroupID == 0 || userGroupID == 0 {
+	if authGroupID == 0 {
 		return []models.BillingRule{}, nil
 	}
 
 	q := h.db.WithContext(ctx).Model(&models.BillingRule{}).Where("is_enabled = ?", true)
-	if defaultAuthGroupID != 0 && defaultUserGroupID != 0 && (defaultAuthGroupID != authGroupID || defaultUserGroupID != userGroupID) {
-		q = q.Where("(auth_group_id = ? AND user_group_id = ?) OR (auth_group_id = ? AND user_group_id = ?)", authGroupID, userGroupID, defaultAuthGroupID, defaultUserGroupID)
-	} else {
-		q = q.Where("auth_group_id = ? AND user_group_id = ?", authGroupID, userGroupID)
+	if defaultAuthGroupID != 0 && defaultUserGroupID != 0 {
+		if len(userGroupIDs) > 0 {
+			q = q.Where(
+				"(auth_group_id = ? AND user_group_id IN ?) OR (auth_group_id = ? AND user_group_id = ?)",
+				authGroupID,
+				userGroupIDs,
+				defaultAuthGroupID,
+				defaultUserGroupID,
+			)
+		} else {
+			q = q.Where("auth_group_id = ? AND user_group_id = ?", defaultAuthGroupID, defaultUserGroupID)
+		}
+	} else if len(userGroupIDs) > 0 {
+		q = q.Where("auth_group_id = ? AND user_group_id IN ?", authGroupID, userGroupIDs)
 	}
 	var rules []models.BillingRule
 	if errFind := q.Find(&rules).Error; errFind != nil {

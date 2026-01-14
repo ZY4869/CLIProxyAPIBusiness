@@ -41,6 +41,13 @@ func migratePostgres(conn *gorm.DB) error {
 		return fmt.Errorf("db: rename recharge_cards: %w", errRename)
 	}
 
+	if errPreAuthGroup := preMigrateAuthGroupIDsPostgres(conn); errPreAuthGroup != nil {
+		return errPreAuthGroup
+	}
+	if errPreUserGroup := preMigrateUserGroupIDsPostgres(conn); errPreUserGroup != nil {
+		return errPreUserGroup
+	}
+
 	if errAutoMigrate := conn.AutoMigrate(
 		&models.Admin{},
 		&models.Plan{},
@@ -80,6 +87,9 @@ func migratePostgres(conn *gorm.DB) error {
 	}
 	if errAuthGroup := migrateAuthGroupIDsPostgres(conn); errAuthGroup != nil {
 		return errAuthGroup
+	}
+	if errUserGroup := migrateUserGroupIDsPostgres(conn); errUserGroup != nil {
+		return errUserGroup
 	}
 
 	if errDropRuleType := conn.Exec(`
@@ -135,6 +145,23 @@ func migratePostgres(conn *gorm.DB) error {
 		CREATE INDEX IF NOT EXISTS idx_prepaid_cards_redeemed_expiry ON prepaid_cards (redeemed_user_id, expires_at)
 	`).Error; errExpireIdx != nil {
 		return fmt.Errorf("db: add prepaid expiry index: %w", errExpireIdx)
+	}
+	if errGroupIdx := conn.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_prepaid_cards_redeemed_user_group ON prepaid_cards (redeemed_user_id, user_group_id)
+	`).Error; errGroupIdx != nil {
+		return fmt.Errorf("db: add prepaid user group index: %w", errGroupIdx)
+	}
+	if errBackfill := conn.Exec(`
+		UPDATE prepaid_cards AS prepaid
+		SET user_group_id = (users.user_group_id->>0)::bigint
+		FROM users
+		WHERE prepaid.user_group_id IS NULL
+		AND prepaid.redeemed_user_id IS NOT NULL
+		AND prepaid.redeemed_user_id = users.id
+		AND jsonb_typeof(users.user_group_id) = 'array'
+		AND jsonb_array_length(users.user_group_id) > 0
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill prepaid user group: %w", errBackfill)
 	}
 	if errDropUserBalance := conn.Exec(`
 		ALTER TABLE users
@@ -497,6 +524,13 @@ func migratePostgres(conn *gorm.DB) error {
 			`,
 		},
 		{
+			name: "idx_usages_user_id_user_group_requested_at",
+			sql: `
+				CREATE INDEX IF NOT EXISTS idx_usages_user_id_user_group_requested_at
+				ON usages (user_id, user_group_id, requested_at)
+			`,
+		},
+		{
 			name: "idx_user_model_auth_bindings_user_model",
 			sql: `
 				CREATE UNIQUE INDEX IF NOT EXISTS idx_user_model_auth_bindings_user_model
@@ -719,6 +753,12 @@ func migrateSQLite(conn *gorm.DB) error {
 	if errSeed := ensureRateLimitSetting(conn); errSeed != nil {
 		return errSeed
 	}
+	if errAuthGroup := migrateAuthGroupIDsSQLite(conn); errAuthGroup != nil {
+		return errAuthGroup
+	}
+	if errUserGroup := migrateUserGroupIDsSQLite(conn); errUserGroup != nil {
+		return errUserGroup
+	}
 
 	if errDropPayloadIndex := conn.Exec(`
 		DROP INDEX IF EXISTS idx_model_payload_rules_enabled
@@ -738,6 +778,23 @@ func migrateSQLite(conn *gorm.DB) error {
 		WHERE balance = 0 AND amount > 0
 	`).Error; errBalanceBackfill != nil {
 		return fmt.Errorf("db: backfill prepaid balance: %w", errBalanceBackfill)
+	}
+	if errGroupIdx := conn.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_prepaid_cards_redeemed_user_group ON prepaid_cards (redeemed_user_id, user_group_id)
+	`).Error; errGroupIdx != nil {
+		return fmt.Errorf("db: add prepaid user group index: %w", errGroupIdx)
+	}
+	if errBackfill := conn.Exec(`
+		UPDATE prepaid_cards
+		SET user_group_id = (
+			SELECT json_extract(users.user_group_id, '$[0]')
+			FROM users
+			WHERE users.id = prepaid_cards.redeemed_user_id
+		)
+		WHERE user_group_id IS NULL
+		AND redeemed_user_id IS NOT NULL
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill prepaid user group: %w", errBackfill)
 	}
 
 	if errAdminPermUpdate := conn.Exec(`
@@ -976,6 +1033,64 @@ func migrateSQLite(conn *gorm.DB) error {
 	return nil
 }
 
+func preMigrateAuthGroupIDsPostgres(conn *gorm.DB) error {
+	if conn == nil {
+		return fmt.Errorf("db: pre-migrate auth group ids: nil connection")
+	}
+	if errAlter := conn.Exec(`
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM information_schema.columns
+				WHERE table_name = 'auths'
+				AND column_name = 'auth_group_id'
+				AND data_type <> 'jsonb'
+			) THEN
+				ALTER TABLE auths
+					ALTER COLUMN auth_group_id TYPE jsonb
+					USING CASE
+						WHEN auth_group_id IS NULL THEN '[]'::jsonb
+						ELSE to_jsonb(ARRAY[auth_group_id])
+					END;
+			END IF;
+		END $$;
+	`).Error; errAlter != nil {
+		return fmt.Errorf("db: pre-migrate auth group ids: %w", errAlter)
+	}
+	return nil
+}
+
+func preMigrateUserGroupIDsPostgres(conn *gorm.DB) error {
+	if conn == nil {
+		return fmt.Errorf("db: pre-migrate user group ids: nil connection")
+	}
+	if errAlter := conn.Exec(`
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM information_schema.columns
+				WHERE table_name = 'users'
+				AND column_name = 'user_group_id'
+				AND data_type <> 'jsonb'
+			) THEN
+				ALTER TABLE users DROP CONSTRAINT IF EXISTS fk_user_groups_users;
+				ALTER TABLE users DROP CONSTRAINT IF EXISTS fk_users_user_group;
+				ALTER TABLE users
+					ALTER COLUMN user_group_id TYPE jsonb
+					USING CASE
+						WHEN user_group_id IS NULL OR user_group_id = 0 THEN '[]'::jsonb
+						ELSE to_jsonb(ARRAY[user_group_id])
+					END;
+			END IF;
+		END $$;
+	`).Error; errAlter != nil {
+		return fmt.Errorf("db: pre-migrate user group ids: %w", errAlter)
+	}
+	return nil
+}
+
 func migrateAuthGroupIDsPostgres(conn *gorm.DB) error {
 	if conn == nil {
 		return fmt.Errorf("db: migrate auth group ids: nil connection")
@@ -1057,6 +1172,284 @@ func migrateAuthGroupIDsSQLite(conn *gorm.DB) error {
 		WHERE auth_group_id IS NULL
 	`).Error; errUpdate != nil {
 		return fmt.Errorf("db: backfill auth group ids: %w", errUpdate)
+	}
+	return nil
+}
+
+func migrateUserGroupIDsPostgres(conn *gorm.DB) error {
+	if conn == nil {
+		return fmt.Errorf("db: migrate user group ids: nil connection")
+	}
+	if errAlter := conn.Exec(`
+		DO $$
+		BEGIN
+			IF EXISTS (
+				SELECT 1
+				FROM information_schema.columns
+				WHERE table_name = 'users'
+				AND column_name = 'user_group_id'
+				AND data_type <> 'jsonb'
+			) THEN
+				ALTER TABLE users DROP CONSTRAINT IF EXISTS fk_user_groups_users;
+				ALTER TABLE users DROP CONSTRAINT IF EXISTS fk_users_user_group;
+				ALTER TABLE users
+					ALTER COLUMN user_group_id TYPE jsonb
+					USING CASE
+						WHEN user_group_id IS NULL THEN '[]'::jsonb
+						ELSE to_jsonb(ARRAY[user_group_id])
+					END;
+			END IF;
+		END $$;
+	`).Error; errAlter != nil {
+		return fmt.Errorf("db: migrate user group ids: %w", errAlter)
+	}
+	if errNormalize := conn.Exec(`
+		UPDATE users
+		SET user_group_id = to_jsonb(ARRAY[user_group_id::bigint])
+		WHERE jsonb_typeof(user_group_id) = 'number'
+	`).Error; errNormalize != nil {
+		return fmt.Errorf("db: normalize user group ids: %w", errNormalize)
+	}
+	if errBackfill := conn.Exec(`
+		UPDATE users
+		SET user_group_id = '[]'::jsonb
+		WHERE user_group_id IS NULL
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill user group ids: %w", errBackfill)
+	}
+	if errDefault := conn.Exec(`
+		ALTER TABLE users
+		ALTER COLUMN user_group_id SET DEFAULT '[]'::jsonb
+	`).Error; errDefault != nil {
+		return fmt.Errorf("db: default user group ids: %w", errDefault)
+	}
+	if errNotNull := conn.Exec(`
+		ALTER TABLE users
+		ALTER COLUMN user_group_id SET NOT NULL
+	`).Error; errNotNull != nil {
+		return fmt.Errorf("db: enforce user group ids not null: %w", errNotNull)
+	}
+
+	if errBackfill := conn.Exec(`
+		UPDATE users
+		SET bill_user_group_id = '[]'::jsonb
+		WHERE bill_user_group_id IS NULL
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill bill user group ids: %w", errBackfill)
+	}
+	if errDefault := conn.Exec(`
+		ALTER TABLE users
+		ALTER COLUMN bill_user_group_id SET DEFAULT '[]'::jsonb
+	`).Error; errDefault != nil {
+		return fmt.Errorf("db: default bill user group ids: %w", errDefault)
+	}
+	if errNotNull := conn.Exec(`
+		ALTER TABLE users
+		ALTER COLUMN bill_user_group_id SET NOT NULL
+	`).Error; errNotNull != nil {
+		return fmt.Errorf("db: enforce bill user group ids not null: %w", errNotNull)
+	}
+
+	if errBackfill := conn.Exec(`
+		UPDATE auth_groups
+		SET user_group_id = '[]'::jsonb
+		WHERE user_group_id IS NULL
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill auth group user group ids: %w", errBackfill)
+	}
+	if errDefault := conn.Exec(`
+		ALTER TABLE auth_groups
+		ALTER COLUMN user_group_id SET DEFAULT '[]'::jsonb
+	`).Error; errDefault != nil {
+		return fmt.Errorf("db: default auth group user group ids: %w", errDefault)
+	}
+	if errNotNull := conn.Exec(`
+		ALTER TABLE auth_groups
+		ALTER COLUMN user_group_id SET NOT NULL
+	`).Error; errNotNull != nil {
+		return fmt.Errorf("db: enforce auth group user group ids not null: %w", errNotNull)
+	}
+
+	if errBackfill := conn.Exec(`
+		UPDATE model_mappings
+		SET user_group_id = '[]'::jsonb
+		WHERE user_group_id IS NULL
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill model mapping user group ids: %w", errBackfill)
+	}
+	if errDefault := conn.Exec(`
+		ALTER TABLE model_mappings
+		ALTER COLUMN user_group_id SET DEFAULT '[]'::jsonb
+	`).Error; errDefault != nil {
+		return fmt.Errorf("db: default model mapping user group ids: %w", errDefault)
+	}
+	if errNotNull := conn.Exec(`
+		ALTER TABLE model_mappings
+		ALTER COLUMN user_group_id SET NOT NULL
+	`).Error; errNotNull != nil {
+		return fmt.Errorf("db: enforce model mapping user group ids not null: %w", errNotNull)
+	}
+
+	if errBackfill := conn.Exec(`
+		UPDATE plans
+		SET user_group_id = '[]'::jsonb
+		WHERE user_group_id IS NULL
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill plan user group ids: %w", errBackfill)
+	}
+	if errDefault := conn.Exec(`
+		ALTER TABLE plans
+		ALTER COLUMN user_group_id SET DEFAULT '[]'::jsonb
+	`).Error; errDefault != nil {
+		return fmt.Errorf("db: default plan user group ids: %w", errDefault)
+	}
+	if errNotNull := conn.Exec(`
+		ALTER TABLE plans
+		ALTER COLUMN user_group_id SET NOT NULL
+	`).Error; errNotNull != nil {
+		return fmt.Errorf("db: enforce plan user group ids not null: %w", errNotNull)
+	}
+
+	if errBackfill := conn.Exec(`
+		UPDATE bills
+		SET user_group_id = '[]'::jsonb
+		WHERE user_group_id IS NULL
+	`).Error; errBackfill != nil {
+		return fmt.Errorf("db: backfill bill user group ids: %w", errBackfill)
+	}
+	if errDefault := conn.Exec(`
+		ALTER TABLE bills
+		ALTER COLUMN user_group_id SET DEFAULT '[]'::jsonb
+	`).Error; errDefault != nil {
+		return fmt.Errorf("db: default bill user group ids: %w", errDefault)
+	}
+	if errNotNull := conn.Exec(`
+		ALTER TABLE bills
+		ALTER COLUMN user_group_id SET NOT NULL
+	`).Error; errNotNull != nil {
+		return fmt.Errorf("db: enforce bill user group ids not null: %w", errNotNull)
+	}
+
+	ddls := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "idx_users_user_group_id_gin",
+			sql: `
+				CREATE INDEX IF NOT EXISTS idx_users_user_group_id_gin
+				ON users USING gin (user_group_id)
+			`,
+		},
+		{
+			name: "idx_users_bill_user_group_id_gin",
+			sql: `
+				CREATE INDEX IF NOT EXISTS idx_users_bill_user_group_id_gin
+				ON users USING gin (bill_user_group_id)
+			`,
+		},
+		{
+			name: "idx_auth_groups_user_group_id_gin",
+			sql: `
+				CREATE INDEX IF NOT EXISTS idx_auth_groups_user_group_id_gin
+				ON auth_groups USING gin (user_group_id)
+			`,
+		},
+		{
+			name: "idx_model_mappings_user_group_id_gin",
+			sql: `
+				CREATE INDEX IF NOT EXISTS idx_model_mappings_user_group_id_gin
+				ON model_mappings USING gin (user_group_id)
+			`,
+		},
+		{
+			name: "idx_plans_user_group_id_gin",
+			sql: `
+				CREATE INDEX IF NOT EXISTS idx_plans_user_group_id_gin
+				ON plans USING gin (user_group_id)
+			`,
+		},
+		{
+			name: "idx_bills_user_group_id_gin",
+			sql: `
+				CREATE INDEX IF NOT EXISTS idx_bills_user_group_id_gin
+				ON bills USING gin (user_group_id)
+			`,
+		},
+	}
+	for _, item := range ddls {
+		if errDDL := conn.Exec(item.sql).Error; errDDL != nil {
+			return fmt.Errorf("db: create index %s: %w", item.name, errDDL)
+		}
+	}
+
+	return nil
+}
+
+func migrateUserGroupIDsSQLite(conn *gorm.DB) error {
+	if conn == nil {
+		return fmt.Errorf("db: migrate user group ids: nil connection")
+	}
+	if errUpdate := conn.Exec(`
+		UPDATE users
+		SET user_group_id = printf('[%d]', user_group_id)
+		WHERE user_group_id IS NOT NULL
+		AND typeof(user_group_id) IN ('integer', 'real')
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: convert user group ids: %w", errUpdate)
+	}
+	if errUpdate := conn.Exec(`
+		UPDATE users
+		SET user_group_id = '[' || user_group_id || ']'
+		WHERE user_group_id IS NOT NULL
+		AND typeof(user_group_id) = 'text'
+		AND user_group_id NOT LIKE '[%'
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: normalize user group ids: %w", errUpdate)
+	}
+	if errUpdate := conn.Exec(`
+		UPDATE users
+		SET user_group_id = '[]'
+		WHERE user_group_id IS NULL
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: backfill user group ids: %w", errUpdate)
+	}
+
+	if errUpdate := conn.Exec(`
+		UPDATE users
+		SET bill_user_group_id = '[]'
+		WHERE bill_user_group_id IS NULL
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: backfill bill user group ids: %w", errUpdate)
+	}
+
+	if errUpdate := conn.Exec(`
+		UPDATE auth_groups
+		SET user_group_id = '[]'
+		WHERE user_group_id IS NULL
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: backfill auth group user group ids: %w", errUpdate)
+	}
+	if errUpdate := conn.Exec(`
+		UPDATE model_mappings
+		SET user_group_id = '[]'
+		WHERE user_group_id IS NULL
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: backfill model mapping user group ids: %w", errUpdate)
+	}
+	if errUpdate := conn.Exec(`
+		UPDATE plans
+		SET user_group_id = '[]'
+		WHERE user_group_id IS NULL
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: backfill plan user group ids: %w", errUpdate)
+	}
+	if errUpdate := conn.Exec(`
+		UPDATE bills
+		SET user_group_id = '[]'
+		WHERE user_group_id IS NULL
+	`).Error; errUpdate != nil {
+		return fmt.Errorf("db: backfill bill user group ids: %w", errUpdate)
 	}
 	return nil
 }

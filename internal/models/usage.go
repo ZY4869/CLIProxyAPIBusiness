@@ -11,9 +11,10 @@ type Usage struct {
 	Provider string `gorm:"type:text;not null;index"` // Provider name.
 	Model    string `gorm:"type:text;not null;index"` // Model name.
 
-	UserID   *uint64 `gorm:"index"` // Related user ID.
-	APIKeyID *uint64 `gorm:"index"` // Related API key ID.
-	AuthID   *uint64 `gorm:"index"` // Related auth ID.
+	UserID      *uint64 `gorm:"index"` // Related user ID.
+	UserGroupID *uint64 `gorm:"index"` // Billing user group ID, when available.
+	APIKeyID    *uint64 `gorm:"index"` // Related API key ID.
+	AuthID      *uint64 `gorm:"index"` // Related auth ID.
 
 	AuthKey   string `gorm:"type:text;index"` // Auth key value.
 	AuthIndex string `gorm:"type:text"`       // Auth index identifier.

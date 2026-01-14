@@ -10,6 +10,8 @@ type AuthGroup struct {
 	IsDefault bool   `gorm:"not null;default:false"`         // Marks the default group.
 	RateLimit int    `gorm:"not null;default:0"`             // Rate limit per second.
 
+	UserGroupID UserGroupIDs `gorm:"type:jsonb;not null;default:'[]'"` // Allowed user group IDs.
+
 	Auths []Auth `gorm:"-"` // Related auth records (not persisted).
 
 	CreatedAt time.Time `gorm:"not null;autoCreateTime"` // Creation timestamp.

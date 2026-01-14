@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	sdkcliproxy "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy"
+	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelmapping"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelregistry"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 	internalsettings "github.com/router-for-me/CLIProxyAPIBusiness/internal/settings"
@@ -36,10 +38,14 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 		switch path {
 		case "/v1/models":
 			onlyMapped := dbConfigBool("ONLY_MAPPED_MODELS")
+			userGroups, billUserGroups, okUser := loadUserGroupMembership(c, db)
 			userAgent := c.GetHeader("User-Agent")
 			if strings.HasPrefix(userAgent, "claude-cli") {
 				if !onlyMapped {
 					data := sdkcliproxy.GlobalModelRegistry().GetAvailableModels("claude")
+					if okUser {
+						data = filterOpenAIRegistryModelsByUserGroups(data, "claude", userGroups, billUserGroups)
+					}
 					c.AbortWithStatusJSON(http.StatusOK, gin.H{"data": data})
 					return
 				}
@@ -48,6 +54,10 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 				if errList != nil {
 					c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
 					return
+				}
+
+				if okUser {
+					modelInfos = filterModelInfosByUserGroups(modelInfos, userGroups, billUserGroups)
 				}
 
 				data := make([]map[string]any, 0, len(modelInfos))
@@ -63,8 +73,17 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 
 			if !onlyMapped {
 				allModels := sdkcliproxy.GlobalModelRegistry().GetAvailableModels("openai")
-				filtered := make([]map[string]any, len(allModels))
-				for i, model := range allModels {
+				filtered := make([]map[string]any, 0, len(allModels))
+				for _, model := range allModels {
+					if okUser {
+						if id, ok := model["id"].(string); ok && strings.TrimSpace(id) != "" {
+							if allowed, okAllowed := modelmapping.LookupUserGroupIDs("openai", strings.TrimSpace(id)); okAllowed && len(allowed.Clean()) > 0 {
+								if !hasAnyAllowedUserGroup(allowed, userGroups, billUserGroups) {
+									continue
+								}
+							}
+						}
+					}
 					filteredModel := map[string]any{
 						"id":     model["id"],
 						"object": model["object"],
@@ -75,7 +94,7 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 					if ownedBy, exists := model["owned_by"]; exists {
 						filteredModel["owned_by"] = ownedBy
 					}
-					filtered[i] = filteredModel
+					filtered = append(filtered, filteredModel)
 				}
 				c.AbortWithStatusJSON(http.StatusOK, gin.H{"object": "list", "data": filtered})
 				return
@@ -85,6 +104,10 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 			if errList != nil {
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
 				return
+			}
+
+			if okUser {
+				modelInfos = filterModelInfosByUserGroups(modelInfos, userGroups, billUserGroups)
 			}
 
 			data := make([]map[string]any, 0, len(modelInfos))
@@ -108,15 +131,23 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 
 		case "/v1beta/models":
 			onlyMapped := dbConfigBool("ONLY_MAPPED_MODELS")
+			userGroups, billUserGroups, okUser := loadUserGroupMembership(c, db)
 			rawModels := make([]map[string]any, 0)
 			if !onlyMapped {
 				rawModels = sdkcliproxy.GlobalModelRegistry().GetAvailableModels("gemini")
+				if okUser {
+					rawModels = filterGeminiRegistryModelsByUserGroups(rawModels, userGroups, billUserGroups)
+				}
 			} else {
 				modelInfos, errList := listMappedModelInfos(c.Request.Context(), db, store)
 				if errList != nil {
 					c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
 					return
 				}
+				if okUser {
+					modelInfos = filterModelInfosByUserGroups(modelInfos, userGroups, billUserGroups)
+				}
+
 				rawModels = make([]map[string]any, 0, len(modelInfos))
 				for _, info := range modelInfos {
 					m := convertModelToMap(info, "gemini")
@@ -149,6 +180,135 @@ func CLIProxyModelsMiddleware(db *gorm.DB, store *modelregistry.Store) gin.Handl
 			return
 		}
 	}
+}
+
+func loadUserGroupMembership(c *gin.Context, db *gorm.DB) (models.UserGroupIDs, models.UserGroupIDs, bool) {
+	if c == nil || db == nil {
+		return nil, nil, false
+	}
+	v, exists := c.Get("accessMetadata")
+	if !exists {
+		return nil, nil, false
+	}
+	meta, ok := v.(map[string]string)
+	if !ok {
+		return nil, nil, false
+	}
+	rawUserID := strings.TrimSpace(meta["user_id"])
+	if rawUserID == "" {
+		return nil, nil, false
+	}
+	parsed, errParse := strconv.ParseUint(rawUserID, 10, 64)
+	if errParse != nil || parsed == 0 {
+		return nil, nil, false
+	}
+	var user models.User
+	if errFind := db.WithContext(c.Request.Context()).
+		Select("user_group_id", "bill_user_group_id").
+		First(&user, parsed).Error; errFind != nil {
+		return nil, nil, false
+	}
+	return user.UserGroupID.Clean(), user.BillUserGroupID.Clean(), true
+}
+
+func hasAnyAllowedUserGroup(allowed, userGroups, billUserGroups models.UserGroupIDs) bool {
+	allowed = allowed.Clean()
+	if len(allowed) == 0 {
+		return true
+	}
+	membership := make(map[uint64]struct{}, len(userGroups)+len(billUserGroups))
+	for _, id := range userGroups.Values() {
+		if id == 0 {
+			continue
+		}
+		membership[id] = struct{}{}
+	}
+	for _, id := range billUserGroups.Values() {
+		if id == 0 {
+			continue
+		}
+		membership[id] = struct{}{}
+	}
+	for _, id := range allowed {
+		if id == nil || *id == 0 {
+			continue
+		}
+		if _, ok := membership[*id]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func filterOpenAIRegistryModelsByUserGroups(raw []map[string]any, provider string, userGroups, billUserGroups models.UserGroupIDs) []map[string]any {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || len(raw) == 0 {
+		return raw
+	}
+	filtered := make([]map[string]any, 0, len(raw))
+	for _, model := range raw {
+		id, _ := model["id"].(string)
+		id = strings.TrimSpace(id)
+		if id != "" {
+			if allowed, okAllowed := modelmapping.LookupUserGroupIDs(provider, id); okAllowed && len(allowed.Clean()) > 0 {
+				if !hasAnyAllowedUserGroup(allowed, userGroups, billUserGroups) {
+					continue
+				}
+			}
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
+}
+
+func filterGeminiRegistryModelsByUserGroups(raw []map[string]any, userGroups, billUserGroups models.UserGroupIDs) []map[string]any {
+	if len(raw) == 0 {
+		return raw
+	}
+	filtered := make([]map[string]any, 0, len(raw))
+	for _, model := range raw {
+		name, _ := model["name"].(string)
+		name = strings.TrimSpace(name)
+		lookup := strings.TrimPrefix(name, "models/")
+		if lookup == "" {
+			lookup = name
+		}
+		if lookup != "" {
+			if allowed, okAllowed := modelmapping.LookupUserGroupIDs("gemini", lookup); okAllowed && len(allowed.Clean()) > 0 {
+				if !hasAnyAllowedUserGroup(allowed, userGroups, billUserGroups) {
+					continue
+				}
+			}
+		}
+		filtered = append(filtered, model)
+	}
+	return filtered
+}
+
+func filterModelInfosByUserGroups(raw []*sdkcliproxy.ModelInfo, userGroups, billUserGroups models.UserGroupIDs) []*sdkcliproxy.ModelInfo {
+	if len(raw) == 0 {
+		return raw
+	}
+	filtered := make([]*sdkcliproxy.ModelInfo, 0, len(raw))
+	for _, info := range raw {
+		if info == nil {
+			continue
+		}
+		modelID := strings.TrimSpace(info.ID)
+		if modelID == "" {
+			continue
+		}
+		provider := strings.ToLower(strings.TrimSpace(info.OwnedBy))
+		if provider != "" {
+			if allowed, okAllowed := modelmapping.LookupUserGroupIDs(provider, modelID); okAllowed && len(allowed.Clean()) > 0 {
+				if !hasAnyAllowedUserGroup(allowed, userGroups, billUserGroups) {
+					continue
+				}
+			}
+		}
+		filtered = append(filtered, info)
+	}
+	return filtered
 }
 
 // normalizeRequestPath trims trailing slashes for route matching.

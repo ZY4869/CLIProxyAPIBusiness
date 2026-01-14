@@ -75,7 +75,7 @@ func (h *AuthHandler) Register(c *gin.Context) {
 	if errFind := h.db.WithContext(c.Request.Context()).
 		Where("is_default = ?", true).
 		First(&defaultGroup).Error; errFind == nil {
-		user.UserGroupID = &defaultGroup.ID
+		user.UserGroupID = models.UserGroupIDs{&defaultGroup.ID}
 	} else if !errors.Is(errFind, gorm.ErrRecordNotFound) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "query default user group failed"})
 		return

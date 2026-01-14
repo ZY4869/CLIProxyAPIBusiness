@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -109,6 +110,7 @@ func (h *BillFrontHandler) Create(c *gin.Context) {
 		bill := models.Bill{
 			PlanID:      plan.ID,
 			UserID:      userID,
+			UserGroupID: plan.UserGroupID.Clean(),
 			PeriodType:  models.BillPeriodTypeMonthly,
 			Amount:      requiredAmount,
 			PeriodStart: now,
@@ -127,6 +129,9 @@ func (h *BillFrontHandler) Create(c *gin.Context) {
 		if errCreateBill := tx.WithContext(c.Request.Context()).Create(&bill).Error; errCreateBill != nil {
 			return errCreateBill
 		}
+		if errRefresh := refreshBillUserGroupIDs(c.Request.Context(), tx, userID); errRefresh != nil {
+			return errRefresh
+		}
 		created = bill
 		return nil
 	})
@@ -141,6 +146,50 @@ func (h *BillFrontHandler) Create(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, h.formatBill(&created))
+}
+
+func refreshBillUserGroupIDs(ctx context.Context, tx *gorm.DB, userID uint64) error {
+	if tx == nil {
+		return errors.New("nil tx")
+	}
+	if userID == 0 {
+		return errors.New("empty user id")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	now := time.Now().UTC()
+	var bills []models.Bill
+	if errFind := tx.WithContext(ctx).
+		Model(&models.Bill{}).
+		Select("user_group_id").
+		Where("user_id = ? AND is_enabled = ? AND status = ? AND left_quota > 0", userID, true, models.BillStatusPaid).
+		Where("period_start <= ? AND period_end >= ?", now, now).
+		Find(&bills).Error; errFind != nil {
+		return errFind
+	}
+
+	seen := make(map[uint64]struct{})
+	merged := make(models.UserGroupIDs, 0)
+	for _, bill := range bills {
+		for _, gid := range bill.UserGroupID.Clean() {
+			if gid == nil || *gid == 0 {
+				continue
+			}
+			if _, ok := seen[*gid]; ok {
+				continue
+			}
+			seen[*gid] = struct{}{}
+			idCopy := *gid
+			merged = append(merged, &idCopy)
+		}
+	}
+
+	return tx.WithContext(ctx).
+		Model(&models.User{}).
+		Where("id = ?", userID).
+		Update("bill_user_group_id", merged.Clean()).Error
 }
 
 // List returns bills for the authenticated user with filters.

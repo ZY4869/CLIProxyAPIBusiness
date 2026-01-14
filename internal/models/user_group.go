@@ -10,7 +10,7 @@ type UserGroup struct {
 	IsDefault bool   `gorm:"not null;default:false"`         // Marks the default group.
 	RateLimit int    `gorm:"not null;default:0"`             // Rate limit per second.
 
-	Users []User `gorm:"foreignKey:UserGroupID"` // Related users.
+	Users []User `gorm:"-"` // Related users (not persisted).
 
 	CreatedAt time.Time `gorm:"not null;autoCreateTime"` // Creation timestamp.
 	UpdatedAt time.Time `gorm:"not null;autoUpdateTime"` // Last update timestamp.

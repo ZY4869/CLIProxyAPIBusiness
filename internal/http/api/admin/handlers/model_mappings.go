@@ -25,13 +25,14 @@ func NewModelMappingHandler(db *gorm.DB) *ModelMappingHandler {
 
 // createModelMappingRequest captures the payload for creating a model mapping.
 type createModelMappingRequest struct {
-	Provider     string `json:"provider"`       // Provider identifier.
-	ModelName    string `json:"model_name"`     // Source model name.
-	NewModelName string `json:"new_model_name"` // Target model name.
-	IsEnabled    *bool  `json:"is_enabled"`     // Optional active flag.
-	Fork         *bool  `json:"fork"`           // Optional fork flag.
-	Selector     *int   `json:"selector"`       // Optional routing selector.
-	RateLimit    *int   `json:"rate_limit"`     // Optional rate limit per second.
+	Provider     string              `json:"provider"`       // Provider identifier.
+	ModelName    string              `json:"model_name"`     // Source model name.
+	NewModelName string              `json:"new_model_name"` // Target model name.
+	UserGroupID  models.UserGroupIDs `json:"user_group_id"`  // Allowed user group IDs.
+	IsEnabled    *bool               `json:"is_enabled"`     // Optional active flag.
+	Fork         *bool               `json:"fork"`           // Optional fork flag.
+	Selector     *int                `json:"selector"`       // Optional routing selector.
+	RateLimit    *int                `json:"rate_limit"`     // Optional rate limit per second.
 }
 
 // Create validates input and inserts a new model mapping.
@@ -84,6 +85,7 @@ func (h *ModelMappingHandler) Create(c *gin.Context) {
 		Fork:         fork,
 		Selector:     selector,
 		RateLimit:    rateLimit,
+		UserGroupID:  body.UserGroupID.Clean(),
 		IsEnabled:    isEnabled,
 		CreatedAt:    now,
 		UpdatedAt:    now,
@@ -152,13 +154,14 @@ func (h *ModelMappingHandler) Get(c *gin.Context) {
 
 // updateModelMappingRequest captures optional fields for mapping updates.
 type updateModelMappingRequest struct {
-	Provider     *string `json:"provider"`       // Optional provider.
-	ModelName    *string `json:"model_name"`     // Optional source model name.
-	NewModelName *string `json:"new_model_name"` // Optional target model name.
-	IsEnabled    *bool   `json:"is_enabled"`     // Optional active flag.
-	Fork         *bool   `json:"fork"`           // Optional fork flag.
-	Selector     *int    `json:"selector"`       // Optional routing selector.
-	RateLimit    *int    `json:"rate_limit"`     // Optional rate limit per second.
+	Provider     *string              `json:"provider"`       // Optional provider.
+	ModelName    *string              `json:"model_name"`     // Optional source model name.
+	NewModelName *string              `json:"new_model_name"` // Optional target model name.
+	UserGroupID  *models.UserGroupIDs `json:"user_group_id"`  // Optional allowed user group IDs.
+	IsEnabled    *bool                `json:"is_enabled"`     // Optional active flag.
+	Fork         *bool                `json:"fork"`           // Optional fork flag.
+	Selector     *int                 `json:"selector"`       // Optional routing selector.
+	RateLimit    *int                 `json:"rate_limit"`     // Optional rate limit per second.
 }
 
 // Update validates and applies model mapping field updates.
@@ -228,6 +231,9 @@ func (h *ModelMappingHandler) Update(c *gin.Context) {
 	}
 	if body.RateLimit != nil {
 		updates["rate_limit"] = *body.RateLimit
+	}
+	if body.UserGroupID != nil {
+		updates["user_group_id"] = body.UserGroupID.Clean()
 	}
 
 	res := h.db.WithContext(c.Request.Context()).Model(&models.ModelMapping{}).Where("id = ?", id).Updates(updates)
@@ -299,6 +305,7 @@ func (h *ModelMappingHandler) formatMapping(m *models.ModelMapping) gin.H {
 		"fork":           m.Fork,
 		"selector":       m.Selector,
 		"rate_limit":     m.RateLimit,
+		"user_group_id":  m.UserGroupID.Clean(),
 		"is_enabled":     m.IsEnabled,
 		"created_at":     m.CreatedAt,
 		"updated_at":     m.UpdatedAt,

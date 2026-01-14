@@ -64,6 +64,42 @@ func (s *Selector) Pick(ctx context.Context, provider, model string, opts clipro
 		return nil, errAvailable
 	}
 
+	var (
+		authGroupIDByAuthKey  map[string]uint64
+		allowedUserGroupsByID map[uint64]models.UserGroupIDs
+		selectedUserGroupID   *uint64
+	)
+	if s != nil && s.db != nil && s.db.Config != nil {
+		userID, okUser := userIDFromContext(ctx)
+		if okUser {
+			userGroupIDs, billUserGroupIDs, errLoad := s.loadUserGroups(ctx, userID)
+			if errLoad != nil {
+				return nil, newModelNotFoundError(provider, model)
+			}
+
+			if mappingUserGroupIDs, okMapping := modelmapping.LookupUserGroupIDs(provider, model); okMapping {
+				mappingUserGroupIDs = mappingUserGroupIDs.Clean()
+				if len(mappingUserGroupIDs) > 0 {
+					selectedUserGroupID = selectFirstAllowedUserGroupID(mappingUserGroupIDs, userGroupIDs, billUserGroupIDs)
+					if selectedUserGroupID == nil {
+						return nil, newModelNotFoundError(provider, model)
+					}
+				}
+			}
+
+			availableFiltered, idByKey, allowedByID, errFilter := s.filterAuthsByAuthGroupUserGroups(ctx, available, userGroupIDs, billUserGroupIDs)
+			if errFilter != nil {
+				return nil, newModelNotFoundError(provider, model)
+			}
+			if len(availableFiltered) == 0 {
+				return nil, newModelNotFoundError(provider, model)
+			}
+			available = availableFiltered
+			authGroupIDByAuthKey = idByKey
+			allowedUserGroupsByID = allowedByID
+		}
+	}
+
 	mappingID, selector := s.loadModelMappingSelector(ctx, provider, model)
 	var selected *coreauth.Auth
 	var errPick error
@@ -81,7 +117,214 @@ func (s *Selector) Pick(ctx context.Context, provider, model string, opts clipro
 	if errLimit := s.applyRateLimit(ctx, provider, model, selected); errLimit != nil {
 		return nil, errLimit
 	}
+
+	if selected != nil && authGroupIDByAuthKey != nil {
+		billingUserGroupID := selectedUserGroupID
+		if billingUserGroupID == nil {
+			authKey := strings.TrimSpace(selected.ID)
+			authGroupID := authGroupIDByAuthKey[authKey]
+			if authGroupID != 0 && allowedUserGroupsByID != nil {
+				allowed := allowedUserGroupsByID[authGroupID].Clean()
+				if len(allowed) > 0 {
+					userID, okUser := userIDFromContext(ctx)
+					if okUser {
+						userGroupIDs, billUserGroupIDs, errLoad := s.loadUserGroups(ctx, userID)
+						if errLoad == nil {
+							billingUserGroupID = selectFirstAllowedUserGroupID(allowed, userGroupIDs, billUserGroupIDs)
+						}
+					}
+				}
+			}
+		}
+		applyBillingUserGroupIDToContext(ctx, billingUserGroupID)
+	}
 	return selected, nil
+}
+
+func newModelNotFoundError(_ string, _ string) error {
+	return &coreauth.Error{Code: "model_not_found", Message: "model not found"}
+}
+
+func (s *Selector) loadUserGroups(ctx context.Context, userID uint64) (models.UserGroupIDs, models.UserGroupIDs, error) {
+	if s == nil || s.db == nil || s.db.Config == nil {
+		return nil, nil, fmt.Errorf("nil db")
+	}
+	if userID == 0 {
+		return nil, nil, fmt.Errorf("empty user id")
+	}
+	var user models.User
+	if errFind := s.db.WithContext(ctx).
+		Select("user_group_id", "bill_user_group_id").
+		First(&user, userID).Error; errFind != nil {
+		return nil, nil, errFind
+	}
+	return user.UserGroupID.Clean(), user.BillUserGroupID.Clean(), nil
+}
+
+func (s *Selector) filterAuthsByAuthGroupUserGroups(
+	ctx context.Context,
+	available []*coreauth.Auth,
+	userGroupIDs models.UserGroupIDs,
+	billUserGroupIDs models.UserGroupIDs,
+) ([]*coreauth.Auth, map[string]uint64, map[uint64]models.UserGroupIDs, error) {
+	if s == nil || s.db == nil || s.db.Config == nil {
+		return available, nil, nil, nil
+	}
+	if len(available) == 0 {
+		return available, nil, nil, nil
+	}
+
+	keys := make([]string, 0, len(available))
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		key := strings.TrimSpace(auth.ID)
+		if key == "" {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return available, nil, nil, nil
+	}
+
+	type authRow struct {
+		Key        string              `gorm:"column:key"`
+		AuthGroups models.AuthGroupIDs `gorm:"column:auth_group_id"`
+	}
+	var rows []authRow
+	if errFind := s.db.WithContext(ctx).
+		Model(&models.Auth{}).
+		Select("key", "auth_group_id").
+		Where("key IN ?", keys).
+		Find(&rows).Error; errFind != nil {
+		return nil, nil, nil, errFind
+	}
+
+	idByKey := make(map[string]uint64, len(rows))
+	groupIDs := make([]uint64, 0, len(rows))
+	seen := make(map[uint64]struct{}, len(rows))
+	for _, row := range rows {
+		key := strings.TrimSpace(row.Key)
+		if key == "" {
+			continue
+		}
+		primary := row.AuthGroups.Primary()
+		if primary == nil || *primary == 0 {
+			continue
+		}
+		idByKey[key] = *primary
+		if _, ok := seen[*primary]; !ok {
+			seen[*primary] = struct{}{}
+			groupIDs = append(groupIDs, *primary)
+		}
+	}
+
+	allowedByID := make(map[uint64]models.UserGroupIDs, len(groupIDs))
+	if len(groupIDs) > 0 {
+		type groupRow struct {
+			ID          uint64              `gorm:"column:id"`
+			UserGroupID models.UserGroupIDs `gorm:"column:user_group_id"`
+		}
+		var groupRows []groupRow
+		if errFind := s.db.WithContext(ctx).
+			Model(&models.AuthGroup{}).
+			Select("id", "user_group_id").
+			Where("id IN ?", groupIDs).
+			Find(&groupRows).Error; errFind != nil {
+			return nil, nil, nil, errFind
+		}
+		for _, row := range groupRows {
+			if row.ID == 0 {
+				continue
+			}
+			allowedByID[row.ID] = row.UserGroupID.Clean()
+		}
+	}
+
+	filtered := make([]*coreauth.Auth, 0, len(available))
+	for _, auth := range available {
+		if auth == nil {
+			continue
+		}
+		key := strings.TrimSpace(auth.ID)
+		if key == "" {
+			filtered = append(filtered, auth)
+			continue
+		}
+		authGroupID := idByKey[key]
+		if authGroupID == 0 {
+			filtered = append(filtered, auth)
+			continue
+		}
+		allowed := allowedByID[authGroupID].Clean()
+		if len(allowed) == 0 {
+			filtered = append(filtered, auth)
+			continue
+		}
+		if selectFirstAllowedUserGroupID(allowed, userGroupIDs, billUserGroupIDs) != nil {
+			filtered = append(filtered, auth)
+		}
+	}
+
+	return filtered, idByKey, allowedByID, nil
+}
+
+func selectFirstAllowedUserGroupID(allowed, userGroups, billUserGroups models.UserGroupIDs) *uint64 {
+	allowed = allowed.Clean()
+	if len(allowed) == 0 {
+		return nil
+	}
+
+	membership := make(map[uint64]struct{}, len(userGroups)+len(billUserGroups))
+	for _, id := range userGroups.Values() {
+		if id == 0 {
+			continue
+		}
+		membership[id] = struct{}{}
+	}
+	for _, id := range billUserGroups.Values() {
+		if id == 0 {
+			continue
+		}
+		membership[id] = struct{}{}
+	}
+
+	for _, id := range allowed {
+		if id == nil || *id == 0 {
+			continue
+		}
+		if _, ok := membership[*id]; !ok {
+			continue
+		}
+		idCopy := *id
+		return &idCopy
+	}
+	return nil
+}
+
+func applyBillingUserGroupIDToContext(ctx context.Context, userGroupID *uint64) {
+	if ctx == nil {
+		return
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil {
+		return
+	}
+	v, exists := ginCtx.Get("accessMetadata")
+	if !exists {
+		return
+	}
+	meta, ok := v.(map[string]string)
+	if !ok || meta == nil {
+		return
+	}
+	if userGroupID == nil || *userGroupID == 0 {
+		delete(meta, "billing_user_group_id")
+		return
+	}
+	meta["billing_user_group_id"] = strconv.FormatUint(*userGroupID, 10)
 }
 
 func (s *Selector) applyRateLimit(ctx context.Context, provider, model string, selected *coreauth.Auth) error {

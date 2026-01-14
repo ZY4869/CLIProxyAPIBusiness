@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/billing"
+	dbutil "github.com/router-for-me/CLIProxyAPIBusiness/internal/db"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/modelmapping"
 	"github.com/router-for-me/CLIProxyAPIBusiness/internal/models"
 
@@ -56,6 +57,15 @@ func (p *GormUsagePlugin) HandleUsage(ctx context.Context, record coreusage.Reco
 		}
 	}
 
+	var billingUserGroupID *uint64
+	if rawID := strings.TrimSpace(meta["billing_user_group_id"]); rawID != "" {
+		parsed, errParseUint := strconv.ParseUint(rawID, 10, 64)
+		if errParseUint == nil && parsed != 0 {
+			parsedID := parsed
+			billingUserGroupID = &parsedID
+		}
+	}
+
 	authKey := strings.TrimSpace(record.AuthID)
 	authID := resolveAuthRecordID(dbCtx, p.db, authKey)
 
@@ -74,13 +84,14 @@ func (p *GormUsagePlugin) HandleUsage(ctx context.Context, record coreusage.Reco
 	recordForBilling.Provider = provider
 	recordForBilling.Model = model
 
-	costMicros := calculateCost(dbCtx, p.db, apiKeyID, userID, authID, recordForBilling)
+	costMicros := calculateCost(dbCtx, p.db, apiKeyID, userID, authID, billingUserGroupID, recordForBilling)
 	amountToDeduct := float64(costMicros) / 1_000_000
 
 	row := models.Usage{
 		Provider:        provider,
 		Model:           model,
 		UserID:          userID,
+		UserGroupID:     billingUserGroupID,
 		APIKeyID:        apiKeyID,
 		AuthID:          authID,
 		AuthKey:         authKey,
@@ -103,12 +114,12 @@ func (p *GormUsagePlugin) HandleUsage(ctx context.Context, record coreusage.Reco
 		}
 
 		if amountToDeduct > 0 && row.UserID != nil {
-			deducted, errDeductBill := deductBillBalance(dbCtx, tx, *row.UserID, amountToDeduct, costMicros)
+			deducted, errDeductBill := deductBillBalance(dbCtx, tx, *row.UserID, billingUserGroupID, amountToDeduct, costMicros)
 			if errDeductBill != nil {
 				return errDeductBill
 			}
 			if !deducted {
-				if errDeductPrepaid := deductPrepaidBalance(dbCtx, tx, *row.UserID, amountToDeduct); errDeductPrepaid != nil {
+				if errDeductPrepaid := deductPrepaidBalance(dbCtx, tx, *row.UserID, billingUserGroupID, amountToDeduct); errDeductPrepaid != nil {
 					return errDeductPrepaid
 				}
 			}
@@ -151,7 +162,7 @@ func resolveAuthRecordID(ctx context.Context, db *gorm.DB, authKey string) *uint
 const billQuotaEpsilon = 0.000001
 
 // deductBillBalance deducts usage from active bills and updates quotas.
-func deductBillBalance(ctx context.Context, tx *gorm.DB, userID uint64, amount float64, costMicros int64) (bool, error) {
+func deductBillBalance(ctx context.Context, tx *gorm.DB, userID uint64, userGroupID *uint64, amount float64, costMicros int64) (bool, error) {
 	if tx == nil {
 		return false, errors.New("nil tx")
 	}
@@ -161,12 +172,16 @@ func deductBillBalance(ctx context.Context, tx *gorm.DB, userID uint64, amount f
 
 	now := time.Now().UTC()
 	var bills []models.Bill
-	if errBills := tx.WithContext(ctx).
+	q := tx.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("user_id = ? AND is_enabled = ? AND status = ? AND left_quota > 0", userID, true, models.BillStatusPaid).
 		Where("period_start <= ? AND period_end >= ?", now, now).
 		Order("period_end ASC, period_start ASC, id ASC").
-		Find(&bills).Error; errBills != nil {
+		Model(&models.Bill{})
+	if userGroupID != nil && *userGroupID != 0 {
+		q = q.Where(dbutil.JSONArrayContainsExpr(tx, "user_group_id"), dbutil.JSONArrayContainsValue(tx, *userGroupID))
+	}
+	if errBills := q.Find(&bills).Error; errBills != nil {
 		return false, errBills
 	}
 	if len(bills) == 0 {
@@ -194,7 +209,7 @@ func deductBillBalance(ctx context.Context, tx *gorm.DB, userID uint64, amount f
 	}
 
 	if !unlimitedDaily && totalDaily > 0 {
-		usedToday, errUsage := loadTodayUsageAmount(ctx, tx, userID, now)
+		usedToday, errUsage := loadTodayUsageAmount(ctx, tx, userID, userGroupID, now)
 		if errUsage != nil {
 			return false, errUsage
 		}
@@ -236,11 +251,54 @@ func deductBillBalance(ctx context.Context, tx *gorm.DB, userID uint64, amount f
 	if remaining > billQuotaEpsilon {
 		return false, errors.New("bill quota not enough after lock")
 	}
+	if errRefresh := refreshBillUserGroupIDs(ctx, tx, userID); errRefresh != nil {
+		return false, errRefresh
+	}
 	return true, nil
 }
 
+func refreshBillUserGroupIDs(ctx context.Context, tx *gorm.DB, userID uint64) error {
+	if tx == nil {
+		return errors.New("nil tx")
+	}
+	if userID == 0 {
+		return errors.New("empty user id")
+	}
+	now := time.Now().UTC()
+	var bills []models.Bill
+	if errFind := tx.WithContext(ctx).
+		Model(&models.Bill{}).
+		Select("user_group_id").
+		Where("user_id = ? AND is_enabled = ? AND status = ? AND left_quota > 0", userID, true, models.BillStatusPaid).
+		Where("period_start <= ? AND period_end >= ?", now, now).
+		Find(&bills).Error; errFind != nil {
+		return errFind
+	}
+
+	seen := make(map[uint64]struct{})
+	merged := make(models.UserGroupIDs, 0)
+	for _, bill := range bills {
+		for _, gid := range bill.UserGroupID.Clean() {
+			if gid == nil || *gid == 0 {
+				continue
+			}
+			if _, ok := seen[*gid]; ok {
+				continue
+			}
+			seen[*gid] = struct{}{}
+			idCopy := *gid
+			merged = append(merged, &idCopy)
+		}
+	}
+
+	return tx.WithContext(ctx).
+		Model(&models.User{}).
+		Where("id = ?", userID).
+		Update("bill_user_group_id", merged.Clean()).Error
+}
+
 // deductPrepaidBalance deducts usage from prepaid cards in priority order.
-func deductPrepaidBalance(ctx context.Context, tx *gorm.DB, userID uint64, amount float64) error {
+func deductPrepaidBalance(ctx context.Context, tx *gorm.DB, userID uint64, userGroupID *uint64, amount float64) error {
 	if tx == nil {
 		return errors.New("nil tx")
 	}
@@ -249,12 +307,16 @@ func deductPrepaidBalance(ctx context.Context, tx *gorm.DB, userID uint64, amoun
 	}
 	now := time.Now().UTC()
 	var cards []models.PrepaidCard
-	if errCards := tx.WithContext(ctx).
+	q := tx.WithContext(ctx).
 		Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("redeemed_user_id = ? AND is_enabled = ? AND balance > 0 AND redeemed_at IS NOT NULL", userID, true).
 		Where("(expires_at IS NULL OR expires_at >= ?)", now).
 		Order("expires_at ASC NULLS LAST, redeemed_at ASC NULLS LAST, id ASC").
-		Find(&cards).Error; errCards != nil {
+		Model(&models.PrepaidCard{})
+	if userGroupID != nil && *userGroupID != 0 {
+		q = q.Where("user_group_id = ?", *userGroupID)
+	}
+	if errCards := q.Find(&cards).Error; errCards != nil {
 		return errCards
 	}
 
@@ -284,7 +346,7 @@ func deductPrepaidBalance(ctx context.Context, tx *gorm.DB, userID uint64, amoun
 }
 
 // loadTodayUsageAmount sums today's usage cost in local time.
-func loadTodayUsageAmount(ctx context.Context, db *gorm.DB, userID uint64, now time.Time) (float64, error) {
+func loadTodayUsageAmount(ctx context.Context, db *gorm.DB, userID uint64, userGroupID *uint64, now time.Time) (float64, error) {
 	if db == nil {
 		return 0, errors.New("nil db")
 	}
@@ -292,11 +354,14 @@ func loadTodayUsageAmount(ctx context.Context, db *gorm.DB, userID uint64, now t
 	localNow := now.In(loc)
 	todayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, loc)
 	var costMicros int64
-	if errSum := db.WithContext(ctx).
+	q := db.WithContext(ctx).
 		Model(&models.Usage{}).
 		Where("user_id = ? AND requested_at >= ?", userID, todayStart).
-		Select("COALESCE(SUM(cost_micros), 0)").
-		Scan(&costMicros).Error; errSum != nil {
+		Select("COALESCE(SUM(cost_micros), 0)")
+	if userGroupID != nil && *userGroupID != 0 {
+		q = q.Where("user_group_id = ?", *userGroupID)
+	}
+	if errSum := q.Scan(&costMicros).Error; errSum != nil {
 		return 0, errSum
 	}
 	return float64(costMicros) / 1_000_000, nil
@@ -335,7 +400,7 @@ func normalizeTime(t time.Time) time.Time {
 }
 
 // calculateCost computes usage cost in micros based on billing rules.
-func calculateCost(ctx context.Context, db *gorm.DB, apiKeyID, userID, authID *uint64, record coreusage.Record) int64 {
+func calculateCost(ctx context.Context, db *gorm.DB, apiKeyID, userID, authID, billingUserGroupID *uint64, record coreusage.Record) int64 {
 	if db == nil {
 		return 0
 	}
@@ -358,20 +423,20 @@ func calculateCost(ctx context.Context, db *gorm.DB, apiKeyID, userID, authID *u
 		}
 	}
 
-	var userGroupID *uint64
-	if apiKeyID != nil {
+	userGroupID := billingUserGroupID
+	if userGroupID == nil && apiKeyID != nil {
 		var apiKey models.APIKey
 		if errFindAPIKey := db.WithContext(ctx).Select("user_id").First(&apiKey, *apiKeyID).Error; errFindAPIKey == nil && apiKey.UserID != nil {
 			var user models.User
 			if errFindUser := db.WithContext(ctx).Select("user_group_id").First(&user, *apiKey.UserID).Error; errFindUser == nil {
-				userGroupID = user.UserGroupID
+				userGroupID = user.UserGroupID.Primary()
 			}
 		}
 	}
 	if userGroupID == nil && userID != nil {
 		var user models.User
 		if errFindUser := db.WithContext(ctx).Select("user_group_id").First(&user, *userID).Error; errFindUser == nil {
-			userGroupID = user.UserGroupID
+			userGroupID = user.UserGroupID.Primary()
 		}
 	}
 

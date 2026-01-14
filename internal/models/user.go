@@ -11,8 +11,10 @@ type User struct {
 	Email    string `gorm:"type:text;uniqueIndex"`          // Email address.
 	Password string `gorm:"type:text;not null"`             // Hashed password.
 
-	UserGroupID *uint64    `gorm:"index"`                  // Assigned user group ID.
-	UserGroup   *UserGroup `gorm:"foreignKey:UserGroupID"` // Assigned user group.
+	UserGroupID UserGroupIDs `gorm:"type:jsonb;not null;default:'[]'"` // Assigned user group IDs.
+	UserGroup   []*UserGroup `gorm:"-"`                                // Assigned user groups.
+
+	BillUserGroupID UserGroupIDs `gorm:"type:jsonb;not null;default:'[]'"` // User group IDs derived from active bills.
 
 	PlanID *uint64 `gorm:"index"`             // Active plan ID.
 	Plan   *Plan   `gorm:"foreignKey:PlanID"` // Active plan.

@@ -78,19 +78,20 @@ func normalizePlanSupportModels(raw json.RawMessage) (datatypes.JSON, error) {
 
 // createPlanRequest captures the payload for creating a plan.
 type createPlanRequest struct {
-	Name          string          `json:"name"`           // Plan name.
-	MonthPrice    float64         `json:"month_price"`    // Monthly price.
-	Description   string          `json:"description"`    // Plan description.
-	SupportModels json.RawMessage `json:"support_models"` // Supported models payload.
-	Feature1      string          `json:"feature1"`       // Feature line 1.
-	Feature2      string          `json:"feature2"`       // Feature line 2.
-	Feature3      string          `json:"feature3"`       // Feature line 3.
-	Feature4      string          `json:"feature4"`       // Feature line 4.
-	SortOrder     int             `json:"sort_order"`     // Display order.
-	TotalQuota    float64         `json:"total_quota"`    // Total quota value.
-	DailyQuota    float64         `json:"daily_quota"`    // Daily quota value.
-	RateLimit     int             `json:"rate_limit"`     // Rate limit per second.
-	IsEnabled     *bool           `json:"is_enabled"`     // Optional active flag.
+	Name          string              `json:"name"`           // Plan name.
+	MonthPrice    float64             `json:"month_price"`    // Monthly price.
+	Description   string              `json:"description"`    // Plan description.
+	SupportModels json.RawMessage     `json:"support_models"` // Supported models payload.
+	UserGroupID   models.UserGroupIDs `json:"user_group_id"`  // Included user group IDs.
+	Feature1      string              `json:"feature1"`       // Feature line 1.
+	Feature2      string              `json:"feature2"`       // Feature line 2.
+	Feature3      string              `json:"feature3"`       // Feature line 3.
+	Feature4      string              `json:"feature4"`       // Feature line 4.
+	SortOrder     int                 `json:"sort_order"`     // Display order.
+	TotalQuota    float64             `json:"total_quota"`    // Total quota value.
+	DailyQuota    float64             `json:"daily_quota"`    // Daily quota value.
+	RateLimit     int                 `json:"rate_limit"`     // Rate limit per second.
+	IsEnabled     *bool               `json:"is_enabled"`     // Optional active flag.
 }
 
 // Create validates input and inserts a new plan.
@@ -123,6 +124,7 @@ func (h *PlanHandler) Create(c *gin.Context) {
 		MonthPrice:    body.MonthPrice,
 		Description:   body.Description,
 		SupportModels: supportModels,
+		UserGroupID:   body.UserGroupID.Clean(),
 		Feature1:      body.Feature1,
 		Feature2:      body.Feature2,
 		Feature3:      body.Feature3,
@@ -189,19 +191,20 @@ func (h *PlanHandler) Get(c *gin.Context) {
 
 // updatePlanRequest captures optional fields for plan updates.
 type updatePlanRequest struct {
-	Name          *string          `json:"name"`           // Optional name update.
-	MonthPrice    *float64         `json:"month_price"`    // Optional monthly price.
-	Description   *string          `json:"description"`    // Optional description.
-	SupportModels *json.RawMessage `json:"support_models"` // Optional supported models payload.
-	Feature1      *string          `json:"feature1"`       // Optional feature line 1.
-	Feature2      *string          `json:"feature2"`       // Optional feature line 2.
-	Feature3      *string          `json:"feature3"`       // Optional feature line 3.
-	Feature4      *string          `json:"feature4"`       // Optional feature line 4.
-	SortOrder     *int             `json:"sort_order"`     // Optional display order.
-	TotalQuota    *float64         `json:"total_quota"`    // Optional total quota.
-	DailyQuota    *float64         `json:"daily_quota"`    // Optional daily quota.
-	RateLimit     *int             `json:"rate_limit"`     // Optional rate limit per second.
-	IsEnabled     *bool            `json:"is_enabled"`     // Optional active flag.
+	Name          *string              `json:"name"`           // Optional name update.
+	MonthPrice    *float64             `json:"month_price"`    // Optional monthly price.
+	Description   *string              `json:"description"`    // Optional description.
+	SupportModels *json.RawMessage     `json:"support_models"` // Optional supported models payload.
+	UserGroupID   *models.UserGroupIDs `json:"user_group_id"`  // Optional included user group IDs.
+	Feature1      *string              `json:"feature1"`       // Optional feature line 1.
+	Feature2      *string              `json:"feature2"`       // Optional feature line 2.
+	Feature3      *string              `json:"feature3"`       // Optional feature line 3.
+	Feature4      *string              `json:"feature4"`       // Optional feature line 4.
+	SortOrder     *int                 `json:"sort_order"`     // Optional display order.
+	TotalQuota    *float64             `json:"total_quota"`    // Optional total quota.
+	DailyQuota    *float64             `json:"daily_quota"`    // Optional daily quota.
+	RateLimit     *int                 `json:"rate_limit"`     // Optional rate limit per second.
+	IsEnabled     *bool                `json:"is_enabled"`     // Optional active flag.
 }
 
 // Update validates and applies plan field updates.
@@ -252,6 +255,9 @@ func (h *PlanHandler) Update(c *gin.Context) {
 			return
 		}
 		updates["support_models"] = supportModels
+	}
+	if body.UserGroupID != nil {
+		updates["user_group_id"] = body.UserGroupID.Clean()
 	}
 	if body.Feature1 != nil {
 		updates["feature1"] = *body.Feature1
@@ -348,6 +354,7 @@ func (h *PlanHandler) formatPlan(p *models.Plan) gin.H {
 		"month_price":    p.MonthPrice,
 		"description":    p.Description,
 		"support_models": p.SupportModels,
+		"user_group_id":  p.UserGroupID.Clean(),
 		"feature1":       p.Feature1,
 		"feature2":       p.Feature2,
 		"feature3":       p.Feature3,

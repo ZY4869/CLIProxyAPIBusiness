@@ -16,6 +16,8 @@ type ModelMapping struct {
 	Selector  int `gorm:"not null;default:0"` // Routing selector.
 	RateLimit int `gorm:"not null;default:0"` // Rate limit per second.
 
+	UserGroupID UserGroupIDs `gorm:"type:jsonb;not null;default:'[]'"` // Allowed user group IDs.
+
 	IsEnabled bool `gorm:"not null;default:true"` // Whether mapping is active.
 
 	CreatedAt time.Time `gorm:"not null;autoCreateTime"` // Creation timestamp.

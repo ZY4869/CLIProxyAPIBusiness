@@ -25,9 +25,10 @@ func NewAuthGroupHandler(db *gorm.DB) *AuthGroupHandler {
 
 // createAuthGroupRequest defines the request body for auth group creation.
 type createAuthGroupRequest struct {
-	Name      string `json:"name"`
-	IsDefault bool   `json:"is_default"`
-	RateLimit int    `json:"rate_limit"`
+	Name        string              `json:"name"`
+	IsDefault   bool                `json:"is_default"`
+	RateLimit   int                 `json:"rate_limit"`
+	UserGroupID models.UserGroupIDs `json:"user_group_id"`
 }
 
 // Create creates a new auth group.
@@ -45,11 +46,12 @@ func (h *AuthGroupHandler) Create(c *gin.Context) {
 
 	now := time.Now().UTC()
 	group := models.AuthGroup{
-		Name:      name,
-		IsDefault: body.IsDefault,
-		RateLimit: body.RateLimit,
-		CreatedAt: now,
-		UpdatedAt: now,
+		Name:        name,
+		IsDefault:   body.IsDefault,
+		RateLimit:   body.RateLimit,
+		UserGroupID: body.UserGroupID.Clean(),
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	}
 
 	errTx := h.db.WithContext(c.Request.Context()).Transaction(func(tx *gorm.DB) error {
@@ -66,12 +68,13 @@ func (h *AuthGroupHandler) Create(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{
-		"id":         group.ID,
-		"name":       group.Name,
-		"is_default": group.IsDefault,
-		"rate_limit": group.RateLimit,
-		"created_at": group.CreatedAt,
-		"updated_at": group.UpdatedAt,
+		"id":            group.ID,
+		"name":          group.Name,
+		"is_default":    group.IsDefault,
+		"rate_limit":    group.RateLimit,
+		"user_group_id": group.UserGroupID.Clean(),
+		"created_at":    group.CreatedAt,
+		"updated_at":    group.UpdatedAt,
 	})
 }
 
@@ -101,12 +104,13 @@ func (h *AuthGroupHandler) List(c *gin.Context) {
 	out := make([]gin.H, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, gin.H{
-			"id":         row.ID,
-			"name":       row.Name,
-			"is_default": row.IsDefault,
-			"rate_limit": row.RateLimit,
-			"created_at": row.CreatedAt,
-			"updated_at": row.UpdatedAt,
+			"id":            row.ID,
+			"name":          row.Name,
+			"is_default":    row.IsDefault,
+			"rate_limit":    row.RateLimit,
+			"user_group_id": row.UserGroupID.Clean(),
+			"created_at":    row.CreatedAt,
+			"updated_at":    row.UpdatedAt,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"auth_groups": out})
@@ -129,20 +133,22 @@ func (h *AuthGroupHandler) Get(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"id":         group.ID,
-		"name":       group.Name,
-		"is_default": group.IsDefault,
-		"rate_limit": group.RateLimit,
-		"created_at": group.CreatedAt,
-		"updated_at": group.UpdatedAt,
+		"id":            group.ID,
+		"name":          group.Name,
+		"is_default":    group.IsDefault,
+		"rate_limit":    group.RateLimit,
+		"user_group_id": group.UserGroupID.Clean(),
+		"created_at":    group.CreatedAt,
+		"updated_at":    group.UpdatedAt,
 	})
 }
 
 // updateAuthGroupRequest defines the request body for auth group updates.
 type updateAuthGroupRequest struct {
-	Name      *string `json:"name"`
-	IsDefault *bool   `json:"is_default"`
-	RateLimit *int    `json:"rate_limit"`
+	Name        *string              `json:"name"`
+	IsDefault   *bool                `json:"is_default"`
+	RateLimit   *int                 `json:"rate_limit"`
+	UserGroupID *models.UserGroupIDs `json:"user_group_id"`
 }
 
 // Update modifies an auth group.
@@ -176,6 +182,9 @@ func (h *AuthGroupHandler) Update(c *gin.Context) {
 		}
 		if body.RateLimit != nil {
 			updates["rate_limit"] = *body.RateLimit
+		}
+		if body.UserGroupID != nil {
+			updates["user_group_id"] = body.UserGroupID.Clean()
 		}
 
 		res := tx.Model(&models.AuthGroup{}).Where("id = ?", id).Updates(updates)
